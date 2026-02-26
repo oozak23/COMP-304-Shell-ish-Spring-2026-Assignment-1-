@@ -6,6 +6,8 @@
 #include <sys/wait.h>
 #include <termios.h> // termios, TCSANOW, ECHO, ICANON
 #include <unistd.h>
+#include <fcntl.h>
+
 const char *sysname = "shellish";
 
 enum return_codes {
@@ -333,7 +335,39 @@ int process_command(struct command_t *command) {
     /// This shows how to do exec with auto-path resolve
     // add a NULL argument to the end of args, and the name to the beginning
     // as required by exec
+    
+    // Handle input redirection
+    if (command -> redirects[0] != NULL){
+      int fd = open(command -> redirects[0], O_RDONLY); // open file only for reading
+      if (fd == -1){
+        perror("Failed to open file for input redirection");
+      }
 
+      dup2(fd, 1); // replace stdout with file
+      close(fd);
+    }
+
+    // Handle output redirection
+    if (command -> redirects[1] != NULL){
+      int fd = open(command -> redirects[1], O_WRONLY | O_CREAT | O_TRUNC, 0644); // open file for writing, create if not exists, truncate if exists
+      if (fd == -1){
+        perror("Failed to open file for output redirection");
+      }
+
+      dup2(fd, 0); // replace stdin with file
+      close(fd);
+    }
+
+    // Handle output append redirection
+    if (command -> redirects[2] != NULL){
+      int fd = open(command -> redirects[2], O_WRONLY | O_CREAT | O_APPEND, 0644); // open file for writing, create if not exists, append if exists
+      if (fd == -1){
+        perror("Failed to open file for output redirection");
+      }
+
+      dup2(fd, 1); // replace stdout with file
+      close(fd);
+    }
     // TODO: do your own exec with path resolving using execv()
     // do so by replacing the execvp call below
     // exec+args+path
