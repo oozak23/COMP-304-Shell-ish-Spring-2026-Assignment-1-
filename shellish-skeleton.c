@@ -312,38 +312,71 @@ int process_command(struct command_t *command); // forward declaration for pipel
                                                 // Pipeline uses process_command to execute the last command in the pipeline, so we need to declare it before pipeline.
 
 int pipeline(struct command_t *command) {
+  if (command == NULL)
+    return SUCCESS;
+
   // Base case: execute the last command in the pipeline
-  if (command->next == NULL) {
+  if (command->next == NULL)
     return process_command(command);
+
+  int fd[2]; 
+  if (pipe(fd) == -1) {
+    perror("pipe");
+    return UNKNOWN;
   }
-  int fd[2];
-  pipe(fd); // create the pipe
-  pid_t pid = fork(); // fork the process
-  if (pid == 0) { // child: runs current command, writes to pipe
-    dup2(fd[1], STDOUT_FILENO); // stdout → pipe write end
-    close(fd[0]); // close unused read end
-    close(fd[1]); // close original write end after dup
-    char *path = getenv("PATH"); // get PATH environment variable
-    char copy_path[1024];
-    strcpy(copy_path, path);
-    char full_path[1024];
-    char *dir = strtok(copy_path, ":");
-    while (dir != NULL) {
-      snprintf(full_path, sizeof(full_path), "%s/%s", dir, command->name);
-      if (access(full_path, X_OK) == 0)
-        execv(full_path, command->args);
-      dir = strtok(NULL, ":");
-    }
-    printf("-%s: %s: command not found\n", sysname, command->name);
-    exit(127);
-  } else { // parent: reads from the pipe and runs the next command in the pipeline
-    dup2(fd[0], STDIN_FILENO); // stdin → pipe read end
+
+  pid_t pid = fork();
+  if (pid == -1) {
+    perror("fork");
     close(fd[0]);
     close(fd[1]);
-    wait(0);
-    pipeline(command->next); // handle next command
+    return UNKNOWN;
   }
-  return SUCCESS;
+
+  if (pid == 0) { // child executes current stage and writes to pipe
+    if (dup2(fd[1], STDOUT_FILENO) == -1) { // redirect stdout to write-end of pipe
+      perror("dup2"); // if dup2 fails, print error and exit
+      _exit(1);
+    }
+    close(fd[0]);
+    close(fd[1]);
+
+    // Prevent recursive re-entry into pipeline from this stage
+    command->next = NULL;
+    int code = process_command(command);
+    _exit(code == EXIT ? SUCCESS : code);
+  }
+
+  // parent feeds next stage from the read-end, then restores stdin
+  int saved_stdin = dup(STDIN_FILENO);
+  if (saved_stdin == -1) {
+    perror("dup");
+    close(fd[0]);
+    close(fd[1]);
+    waitpid(pid, NULL, 0);
+    return UNKNOWN;
+  }
+
+  if (dup2(fd[0], STDIN_FILENO) == -1) { // redirect stdin to read-end of pipe
+    perror("dup2");
+    close(fd[0]);
+    close(fd[1]);
+    close(saved_stdin);
+    waitpid(pid, NULL, 0);
+    return UNKNOWN;
+  }
+  close(fd[0]);
+  close(fd[1]);
+
+  int code = pipeline(command->next); // recursively execute the rest
+
+  if (dup2(saved_stdin, STDIN_FILENO) == -1) // restore stdin
+    perror("dup2"); // if dup2 fails, print error but continue to close and wait
+  close(saved_stdin);
+  clearerr(stdin);
+
+  waitpid(pid, NULL, 0);
+  return code;
 }
 
 int process_command(struct command_t *command) {
@@ -363,10 +396,166 @@ int process_command(struct command_t *command) {
     }
   }
 
+  if (strcmp(command->name, "cut") == 0) {
+    char delimiter = '\t'; // default field delimiter
+    int fields[256]; 
+    int field_count = 0;
+
+    // Parse options: -d, --delimiter, -f, --fields and other forms
+    for (int i = 1; i < command->arg_count - 1; i++) {
+      char *arg = command->args[i]; 
+      if (arg == NULL){
+        continue;
+      }
+
+      // Handle delimiter options
+      if ((strcmp(arg, "-d") == 0 || strcmp(arg, "--delimiter") == 0) && // check for -d or --delimiter
+          i + 1 < command->arg_count - 1 && command->args[i + 1] != NULL) { // ensure next argument exists and is not NULL because we will access it
+        delimiter = command->args[++i][0];
+        continue;
+      }
+
+      
+      if (strncmp(arg, "-d", 2) == 0 && strlen(arg) > 2) { 
+        delimiter = arg[2];
+        continue;
+      }
+      if (strncmp(arg, "--delimiter=", 12) == 0 && strlen(arg) > 12) {
+        delimiter = arg[12];
+        continue;
+      }
+
+      // Handle fields options
+      char *field_list = NULL;
+      if ((strcmp(arg, "-f") == 0 || strcmp(arg, "--fields") == 0) && // check for -f or --fields
+          i + 1 < command->arg_count - 1 && command->args[i + 1] != NULL) { // ensure next argument exists and is not NULL
+        field_list = command->args[++i];
+
+      } else if (strncmp(arg, "-f", 2) == 0 && strlen(arg) > 2) {
+        field_list = arg + 2;
+
+      } else if (strncmp(arg, "--fields=", 9) == 0 && strlen(arg) > 9) {
+        field_list = arg + 9;
+      }
+
+      // If we have a field list, parse it into the fields array
+      if (field_list != NULL) {
+        char list_copy[1024];
+        strncpy(list_copy, field_list, sizeof(list_copy) - 1);
+        list_copy[sizeof(list_copy) - 1] = '\0';
+
+        char *token = strtok(list_copy, ",");
+        while (token != NULL &&
+               field_count < (int)(sizeof(fields) / sizeof(fields[0]))) {
+          char *end_ptr = NULL;
+          long idx = strtol(token, &end_ptr, 10);
+          if (end_ptr != token && *end_ptr == '\0' && idx > 0)
+            fields[field_count++] = (int)idx;
+          token = strtok(NULL, ",");
+        }
+      }
+    }
+
+    int saved_stdin = -1, saved_stdout = -1;
+
+    // Support redirections for builtin execution (same behavior as external).
+    if (command->redirects[0] != NULL) {
+      int fd = open(command->redirects[0], O_RDONLY);
+      if (fd == -1) {
+        perror("Failed to open file for input redirection");
+        return SUCCESS;
+      }
+      saved_stdin = dup(STDIN_FILENO);
+      if (saved_stdin == -1 || dup2(fd, STDIN_FILENO) == -1)
+        perror("dup2");
+      close(fd);
+    }
+
+    if (command->redirects[1] != NULL) {
+      int fd = open(command->redirects[1], O_WRONLY | O_CREAT | O_TRUNC, 0644);
+      if (fd == -1) {
+        perror("Failed to open file for output redirection");
+      } else {
+        saved_stdout = dup(STDOUT_FILENO);
+        if (saved_stdout == -1 || dup2(fd, STDOUT_FILENO) == -1)
+          perror("dup2");
+        close(fd);
+      }
+    }
+
+    if (command->redirects[2] != NULL) {
+      int fd =
+          open(command->redirects[2], O_WRONLY | O_CREAT | O_APPEND, 0644);
+      if (fd == -1) {
+        perror("Failed to open file for output redirection");
+      } else {
+        if (saved_stdout == -1)
+          saved_stdout = dup(STDOUT_FILENO);
+        if (dup2(fd, STDOUT_FILENO) == -1)
+          perror("dup2");
+        close(fd);
+      }
+    }
+
+    // If no valid -f/--fields is provided, mimic a no-op filter by echoing input.
+    char line[4096];
+    if (field_count == 0) {
+      while (fgets(line, sizeof(line), stdin) != NULL)
+        fputs(line, stdout);
+    } else {
+      while (fgets(line, sizeof(line), stdin) != NULL) {
+        bool printed_any = false;
+
+        for (int i = 0; i < field_count; i++) {
+          int target_field = fields[i];
+          int current_field = 1;
+          char *field_start = line;
+          char *field_end = NULL;
+
+          for (char *p = line;; p++) {
+            if (*p == delimiter || *p == '\n' || *p == '\0') {
+              if (current_field == target_field) {
+                field_end = p;
+                break;
+              }
+              if (*p == '\n' || *p == '\0')
+                break;
+              current_field++;
+              field_start = p + 1;
+            }
+          }
+
+          if (field_end != NULL) {
+            if (printed_any)
+              putchar(delimiter);
+            if (field_end > field_start)
+              fwrite(field_start, 1, (size_t)(field_end - field_start), stdout);
+            printed_any = true;
+          }
+        }
+        putchar('\n');
+      }
+    }
+
+    if (saved_stdin != -1) {
+      if (dup2(saved_stdin, STDIN_FILENO) == -1)
+        perror("dup2");
+      close(saved_stdin);
+    }
+    clearerr(stdin);
+    if (saved_stdout != -1) {
+      if (dup2(saved_stdout, STDOUT_FILENO) == -1)
+        perror("dup2");
+      close(saved_stdout);
+    }
+
+    return SUCCESS;
+  }
+
   if (command->next != NULL) {
     return pipeline(command);
   }
-  
+
   pid_t pid = fork();
   if (pid == 0) // child
   {
