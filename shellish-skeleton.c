@@ -8,6 +8,11 @@
 #include <unistd.h>
 #include <fcntl.h>
 
+// for chatroom
+#include <dirent.h>   // opendir, readdir - for iterating room folder
+#include <sys/stat.h> // mkdir, mkfifo, stat - for creating folders and pipes
+#include <signal.h>   // kill, SIGTERM - for stopping the reader child
+
 const char *sysname = "shellish";
 
 enum return_codes {
@@ -551,6 +556,150 @@ int process_command(struct command_t *command) {
 
     return SUCCESS;
   }
+
+
+  if (strcmp(command->name, "chatroom") == 0){
+
+    // Validate arguments
+    if (command->arg_count < 3) {
+        printf("Usage: chatroom <roomname> <username>\n");
+        return SUCCESS;
+    }
+
+    char *roomname = command->args[1];
+    char *username = command->args[2];
+
+    // Build the room folder path: /tmp/chatroom-<roomname>
+    char room_folder[1024];
+    snprintf(room_folder, sizeof(room_folder), "/tmp/chatroom-%s", roomname);
+
+    // Create the room folder if it doesn't exist
+    struct stat st = {0};
+    if (stat(room_folder, &st) == -1) {
+        if (mkdir(room_folder, 0777) == -1) {
+            perror("Failed to create room folder");
+            return SUCCESS; 
+        }
+    }
+
+    // Build the user's named pipe path: /tmp/chatroom-<roomname>/<username>
+    char pipe_path[1024];
+    snprintf(pipe_path, sizeof(pipe_path), "%s/%s", room_folder, username);
+
+    // Create the named pipe for the user if it doesn't exist
+    if (stat(pipe_path, &st) == -1) {
+        if (mkfifo(pipe_path, 0666) == -1) {
+            perror("Failed to create named pipe");
+            return SUCCESS; 
+      }
+    }
+
+    printf("Welcome to %s!\n", roomname);
+    fflush(stdout);
+    
+    // Open the user's named pipe for reading and writing
+    int my_pipe_fd = open(pipe_path, O_RDWR);
+    if (my_pipe_fd == -1) {
+        perror("Failed to open user pipe");
+        return SUCCESS;
+    }
+
+    // Reader child process
+    pid_t reader_pid = fork();
+    if (reader_pid == -1) {
+        perror("Failed to fork reader process");
+        close(my_pipe_fd);
+        return SUCCESS;
+    }else if (reader_pid == 0) { // Reader child
+        char message[4096];
+        while (1) {
+            int n = read(my_pipe_fd, message, sizeof(message) - 1);
+            if (n > 0) {
+                message[n] = '\0';
+                // \r moves cursor to start of line to overwrite the prompt
+                printf("\r%s\n[%s] %s > ", message, roomname, username); // print message and reprint prompt
+                fflush(stdout); // ensure message is printed immediately
+            }
+        }
+        exit(0);
+      }
+    
+    // Parent: handle user input and send messages to others
+    char input[4096];
+    while (1) {
+      printf("[%s] %s > ", roomname, username);
+      fflush(stdout);
+
+      if (fgets(input, sizeof(input), stdin) == NULL)
+        break; // Ctrl+D to exit
+
+      // Trim the newline from fgets
+      int len = strlen(input);
+      if (len > 0 && input[len - 1] == '\n')
+        input[len - 1] = '\0';
+
+      if (strlen(input) == 0)
+        continue; // ignore empty input
+
+      if (strcmp(input, "exit") == 0)
+          break;
+
+      // Build the formatted message: [roomname] username: message
+      char full_msg[2048];
+      snprintf(full_msg, sizeof(full_msg), "[%s] %s: %s", roomname, username, input);
+
+      // Iterate over the room folder to find other users and send them the message
+      DIR *dir = opendir(room_folder);
+      if (dir == NULL) {
+          perror("Failed to open room folder");
+          continue;
+      }
+
+      struct dirent *entry;
+      while ((entry = readdir(dir)) != NULL) {
+          // Skip the special . and .. directory entries
+          if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+              continue;
+          // Skip ourselves - we don't send to our own pipe
+          if (strcmp(entry->d_name, username) == 0)
+              continue;
+
+          // Build the other user's pipe path
+          char other_pipe[1024];
+          snprintf(other_pipe, sizeof(other_pipe), "%s/%s", room_folder, entry->d_name);
+
+          // Fork a child to write to the other user's pipe
+          // (done in a child so we don't block if their pipe is full)
+          pid_t sender_pid = fork();
+          if (sender_pid == 0) {
+              // O_NONBLOCK so we don't hang if no one is reading
+              int fd = open(other_pipe, O_WRONLY | O_NONBLOCK);
+              if (fd != -1) {
+                  write(fd, full_msg, strlen(full_msg));
+                  close(fd);
+              }
+              exit(0);
+          } else {
+              waitpid(sender_pid, NULL, 0); // wait for sender child to finish
+          }
+      }
+      closedir(dir);
+
+      // Echo our own sent message on screen
+      printf("[%s] %s: %s\n", roomname, username, input);
+      fflush(stdout);
+    }
+    
+    // Cleanup when user exits the chatroom
+    kill(reader_pid, SIGTERM);        // stop the reader child
+    waitpid(reader_pid, NULL, 0);     // reap it
+    close(my_pipe_fd);                // close our pipe fd
+    unlink(pipe_path);                // remove our named pipe from the room
+
+    return SUCCESS;
+
+  }
+
 
   if (command->next != NULL) {
     return pipeline(command);
