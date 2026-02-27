@@ -308,6 +308,44 @@ int prompt(struct command_t *command) {
   return SUCCESS;
 }
 
+int process_command(struct command_t *command); // forward declaration for pipeline. 
+                                                // Pipeline uses process_command to execute the last command in the pipeline, so we need to declare it before pipeline.
+
+int pipeline(struct command_t *command) {
+  // Base case: execute the last command in the pipeline
+  if (command->next == NULL) {
+    return process_command(command);
+  }
+  int fd[2];
+  pipe(fd); // create the pipe
+  pid_t pid = fork(); // fork the process
+  if (pid == 0) { // child: runs current command, writes to pipe
+    dup2(fd[1], STDOUT_FILENO); // stdout → pipe write end
+    close(fd[0]); // close unused read end
+    close(fd[1]); // close original write end after dup
+    char *path = getenv("PATH"); // get PATH environment variable
+    char copy_path[1024];
+    strcpy(copy_path, path);
+    char full_path[1024];
+    char *dir = strtok(copy_path, ":");
+    while (dir != NULL) {
+      snprintf(full_path, sizeof(full_path), "%s/%s", dir, command->name);
+      if (access(full_path, X_OK) == 0)
+        execv(full_path, command->args);
+      dir = strtok(NULL, ":");
+    }
+    printf("-%s: %s: command not found\n", sysname, command->name);
+    exit(127);
+  } else { // parent: reads from the pipe and runs the next command in the pipeline
+    dup2(fd[0], STDIN_FILENO); // stdin → pipe read end
+    close(fd[0]);
+    close(fd[1]);
+    wait(0);
+    pipeline(command->next); // handle next command
+  }
+  return SUCCESS;
+}
+
 int process_command(struct command_t *command) {
   int r;
   if (strcmp(command->name, "") == 0)
@@ -325,6 +363,10 @@ int process_command(struct command_t *command) {
     }
   }
 
+  if (command->next != NULL) {
+    return pipeline(command);
+  }
+  
   pid_t pid = fork();
   if (pid == 0) // child
   {
@@ -343,7 +385,7 @@ int process_command(struct command_t *command) {
         perror("Failed to open file for input redirection");
       }
 
-      dup2(fd, 1); // replace stdout with file
+      dup2(fd, 0); // replace stdin with file
       close(fd);
     }
 
@@ -354,7 +396,7 @@ int process_command(struct command_t *command) {
         perror("Failed to open file for output redirection");
       }
 
-      dup2(fd, 0); // replace stdin with file
+      dup2(fd, 1); // replace stdout with file
       close(fd);
     }
 
