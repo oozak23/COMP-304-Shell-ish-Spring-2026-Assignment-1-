@@ -1,4 +1,4 @@
-# COMP-304-Shell-ish-Spring-2026-Assignment-1-
+# COMP-304-Shell-ish-Spring-2026-Assignment-1-Ozan Ozak (oozak23)
 First assignment of COMP 304 Course
 
 ## To build and run:
