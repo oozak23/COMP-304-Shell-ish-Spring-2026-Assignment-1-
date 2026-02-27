@@ -48,7 +48,7 @@ ls -la | grep shell | wc -l
 * I implemented the Unix `cut` command. This command reads the lines from stdin and prints only the wanted fields. There are multiple options to use these command such as:
 
   1) `-d` / `--delimiter` — specify a delimiter
-  2) -f` / `--fields` — comma-separated list of field to print
+  2) `-f` / `--fields` — comma-separated list of field to print
  
 ```bash
 cat /etc/passwd | cut -d: -f1,6
