@@ -700,6 +700,43 @@ int process_command(struct command_t *command) {
 
   }
 
+  if (strcmp(command->name, "remindme") == 0) {
+    // Validate arguments: need at least seconds and a message
+    if (command->arg_count < 3) {
+        printf("Usage: remindme <seconds> <message>\n");
+        return SUCCESS;
+    }
+
+    int seconds = atoi(command->args[1]); // convert seconds argument to integer
+    if (seconds <= 0) {
+        printf("-%s: remindme: invalid time: %s\n", sysname, command->args[1]);
+        return SUCCESS;
+    }
+
+    // Build the full message from all remaining arguments
+    // e.g. remindme 10 check the oven → "check the oven"
+    char message[4096] = "";
+    for (int i = 2; i < command->arg_count - 1; i++) {
+        strcat(message, command->args[i]);
+        if (i < command->arg_count - 2)
+            strcat(message, " "); // add space between words
+    }
+
+    // Fork a background child that sleeps then prints the reminder
+    pid_t pid = fork();
+    if (pid == 0) { // child
+        sleep(seconds); // wait for the specified time
+        // \r to move to start of line and overwrite any prompt currently shown
+        printf("\r\n Reminder: %s\n", message);
+        fflush(stdout);
+        exit(0);
+    } else { // parent: return to prompt immediately
+        printf("[remindme] set for %d second(s): \"%s\"\n", seconds, message);
+        fflush(stdout);
+    }
+
+    return SUCCESS;
+  }
 
   if (command->next != NULL) {
     return pipeline(command);
